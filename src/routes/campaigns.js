@@ -6,9 +6,11 @@ const routingController = require('../controllers/campaignRouting');
 router.get('/', controller.list);
 router.post('/', controller.create);
 router.get('/:id', controller.getOne);
+router.put('/:id', controller.update);
 router.delete('/:id', controller.remove);
 
 router.post('/:id/schedule', controller.schedule);
+router.post('/:id/test', controller.sendTest);
 router.post('/:id/pause', controller.pause);
 router.post('/:id/resume', controller.resume);
 router.post('/:id/cancel', controller.cancel);

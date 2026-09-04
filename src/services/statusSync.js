@@ -8,7 +8,7 @@ const CampaignRecipient = require('../models/campaignRecipient');
 // services/sender.js), falling back to Meta's channelMessageId if that's
 // all the caller has.
 async function syncStatus({ messageId, channelMessageId, status }) {
-  if (!['DELIVERED', 'READ'].includes(status)) return null;
+  if (!['DELIVERED', 'READ', 'FAILED'].includes(status)) return null;
   if (!messageId && !channelMessageId) return null;
 
   const filter = messageId ? { messageId } : { channelMessageId };

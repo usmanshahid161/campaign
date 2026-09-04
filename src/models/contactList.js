@@ -1,10 +1,13 @@
 const mongoose = require('mongoose');
 
-// A named audience list for campaigns — deliberately not the same
-// collection as admin_backend's "Groups" (those organize agents, this
-// organizes recipients). Entries live in their own collection
-// (contactListEntry.js), not embedded here, since a CSV import can run
-// into the thousands and Mongo documents have a 16MB ceiling.
+// A named, reusable audience list — just phone numbers + whatever
+// free-form profile data the business wants to track (name, city,
+// invoice_no, anything). Deliberately NOT bound to any template — the
+// same list gets reused across many different campaigns over time.
+// Template-variable mapping happens at campaign-creation time instead
+// (see campaign-service's services/campaigns.js), where each variable
+// either pulls from a matching column already on this list's contacts,
+// or gets a one-off shared value for that specific campaign.
 const contactListSchema = new mongoose.Schema(
   {
     tenantId: { type: String, required: true, index: true },

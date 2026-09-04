@@ -22,15 +22,12 @@ const campaignSchema = new mongoose.Schema(
     // agent to pick up.
     flowId: { type: String, default: null },
 
-    // Snapshotted at creation time (fetched from admin_backend), not a
-    // live reference — if the underlying Template is edited/deleted
-    // later, a running or completed campaign should still show exactly
-    // what was actually configured. Mirrors admin_backend's own
-    // Template.components shape (literal header/body/footer text with
-    // {{n}} placeholders still in place) rather than Meta's sparse
-    // send-time parameter format — that gets built per-recipient at
-    // send time (see services/templateBuilder.js), filling in each
-    // recipient's own variable values and media.
+    // Snapshotted at creation time (copied from the contact list's own
+    // templateSnapshot, which is itself frozen at list-creation/edit
+    // time), not a live reference — if the list's template later
+    // changes, or the underlying Template is edited, a running or
+    // completed campaign should still show exactly what was actually
+    // configured. Mirrors admin_backend's own Template.components shape.
     template: {
       templateId: { type: String, required: true },
       name: { type: String, required: true },
@@ -41,20 +38,30 @@ const campaignSchema = new mongoose.Schema(
         text: { type: String, default: '' },
       },
       body: { text: { type: String, required: true } },
-      footer: { text: { type: String, default: '' } },
-      buttons: { type: Array, default: [] },
     },
 
-    // Maps a template variable's position to a column name in the
-    // contact list's `variables` — e.g. { "1": "name", "2": "order_id" }.
-    variableMapping: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // Copied from the contact list's own variableConfig at creation time
+    // — per_contact entries carry no value here (looked up by `name` on
+    // each recipient at send time); shared entries always have a final
+    // `value` by the time the campaign is saved, whether that value came
+    // from the list itself or was filled in just now (deferredValues
+    // below, at campaign-creation).
+    resolvedVariables: [
+      {
+        _id: false,
+        component: { type: String, enum: ['header', 'body'] },
+        position: String,
+        name: String,
+        mode: { type: String, enum: ['per_contact', 'shared'] },
+        value: { type: String, default: null }, // shared only
+      },
+    ],
 
-    // 'none' — template has no media header.
-    // 'shared' — every recipient gets the same file (e.g. a promotion).
-    // 'per_contact' — each recipient's own file, from their
-    //   ContactListEntry.mediaUrl (e.g. a lab report unique to them).
-    mediaMode: { type: String, enum: ['none', 'shared', 'per_contact'], default: 'none' },
-    sharedMediaUrl: { type: String, default: null },
+    // Same idea as resolvedVariables, for the header's media if any.
+    resolvedMedia: {
+      mode: { type: String, enum: ['shared', 'per_contact', null], default: null },
+      sharedUrl: { type: String, default: null },
+    },
 
     rateLimitPerMinute: { type: Number, required: true, min: 1 },
 

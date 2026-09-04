@@ -1,10 +1,14 @@
 // services/campaigns.js
+const axios = require('axios');
+const configs = require('../config');
 const Campaign = require('../models/campaign');
 const CampaignRecipient = require('../models/campaignRecipient');
 const ContactListEntry = require('../models/contactListEntry');
 const contactListsService = require('./contactLists');
 const templatesService = require('./templates');
 const optOutsService = require('./optOuts');
+const templateBuilder = require('./templateBuilder');
+const { extractTemplateVariables } = require('./templateVariables');
 
 async function listCampaigns(tenantId) {
   return Campaign.find({ tenantId }).sort({ createdAt: -1 }).lean();
@@ -20,26 +24,30 @@ async function getCampaign(tenantId, id) {
   return campaign;
 }
 
-async function createCampaign(tenantId, authHeader, payload, userId) {
+// Validates a campaign's fields, fetches the template, and resolves
+// every variable/media it needs — per_contact ones just note which
+// list-column to read per recipient (see templateBuilder.js), shared
+// ones need an actual value right here, decided fresh for *this*
+// campaign (the same contact list can be reused for a different
+// template/campaign later with completely different choices).
+async function buildCampaignData(tenantId, authHeader, payload) {
   const {
     name,
     contactListId,
+    templateId,
     queue,
     extension,
     flowId,
-    templateId,
-    variableMapping,
-    mediaMode,
-    sharedMediaUrl,
+    variableConfig,
+    mediaConfig,
     rateLimitPerMinute,
     startAt,
     endAt,
-    saveAsDraft,
   } = payload;
 
-  if (!name?.trim() || !contactListId || !queue || !extension || !templateId || !rateLimitPerMinute || !startAt || !endAt) {
+  if (!name?.trim() || !contactListId || !templateId || !queue || !extension || !rateLimitPerMinute || !startAt || !endAt) {
     const err = new Error(
-      'name, contactListId, queue, extension, templateId, rateLimitPerMinute, startAt and endAt are all required'
+      'name, contactListId, templateId, queue, extension, rateLimitPerMinute, startAt and endAt are all required'
     );
     err.statusCode = 422;
     throw err;
@@ -54,24 +62,53 @@ async function createCampaign(tenantId, authHeader, payload, userId) {
   await contactListsService.getContactList(tenantId, contactListId); // 404s if missing/wrong tenant
 
   const template = await templatesService.getTemplate(authHeader, templateId);
-  if (!['APPROVED'].includes(template.status)) {
+  if (template.status !== 'APPROVED') {
     const err = new Error(`Only APPROVED templates can be used in a campaign (this one is ${template.status})`);
     err.statusCode = 422;
     throw err;
   }
 
-  const resolvedMediaMode = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(template.components?.header?.type)
-    ? mediaMode || 'shared'
-    : 'none';
+  const templateVars = extractTemplateVariables(template);
+  const realVars = templateVars.filter((v) => v.component !== 'media');
+  const mediaVar = templateVars.find((v) => v.component === 'media');
 
-  if (resolvedMediaMode === 'shared' && !sharedMediaUrl) {
-    const err = new Error('sharedMediaUrl is required when mediaMode is "shared"');
+  const configByName = new Map((variableConfig || []).map((c) => [c.name, c]));
+  const missing = realVars.filter((v) => !configByName.has(v.name));
+  if (missing.length) {
+    const err = new Error(`Missing configuration for: ${missing.map((v) => v.name).join(', ')}`);
     err.statusCode = 422;
     throw err;
   }
 
-  const campaign = await Campaign.create({
-    tenantId,
+  const resolvedVariables = realVars.map((v) => {
+    const submitted = configByName.get(v.name);
+    if (submitted.mode === 'shared') {
+      if (!submitted.value?.toString().trim()) {
+        const err = new Error(`"${v.name}" is marked shared but has no value`);
+        err.statusCode = 422;
+        throw err;
+      }
+      return { component: v.component, position: v.position, name: v.name, mode: 'shared', value: String(submitted.value).trim() };
+    }
+    return { component: v.component, position: v.position, name: v.name, mode: 'per_contact', value: null };
+  });
+
+  let resolvedMedia = { mode: null, sharedUrl: null };
+  if (mediaVar) {
+    if (!mediaConfig?.mode) {
+      const err = new Error('This template has a media header — mediaConfig.mode ("shared" or "per_contact") is required');
+      err.statusCode = 422;
+      throw err;
+    }
+    if (mediaConfig.mode === 'shared' && !mediaConfig.sharedUrl) {
+      const err = new Error('sharedUrl is required when media mode is "shared"');
+      err.statusCode = 422;
+      throw err;
+    }
+    resolvedMedia = { mode: mediaConfig.mode, sharedUrl: mediaConfig.mode === 'shared' ? mediaConfig.sharedUrl : null };
+  }
+
+  return {
     name: name.trim(),
     contactListId,
     queue,
@@ -84,15 +121,22 @@ async function createCampaign(tenantId, authHeader, payload, userId) {
       category: template.category,
       header: template.components?.header || { type: 'NONE', text: '' },
       body: { text: template.components?.body?.text || '' },
-      footer: { text: template.components?.footer?.text || '' },
-      buttons: template.components?.buttons || [],
     },
-    variableMapping: variableMapping || {},
-    mediaMode: resolvedMediaMode,
-    sharedMediaUrl: resolvedMediaMode === 'shared' ? sharedMediaUrl : null,
+    resolvedVariables,
+    resolvedMedia,
     rateLimitPerMinute,
     startAt,
     endAt,
+  };
+}
+
+async function createCampaign(tenantId, authHeader, payload, userId) {
+  const { saveAsDraft } = payload;
+  const data = await buildCampaignData(tenantId, authHeader, payload);
+
+  const campaign = await Campaign.create({
+    tenantId,
+    ...data,
     status: saveAsDraft ? 'DRAFT' : 'SCHEDULED',
     createdBy: userId,
   });
@@ -120,28 +164,70 @@ async function materializeRecipients(campaign) {
     throw err;
   }
 
+  // per_contact variables/media need to actually be present on every
+  // entry — checked here (at materialization, not just at creation)
+  // since this is the last point before real sends start.
+  const perContactVarNames = campaign.resolvedVariables.filter((v) => v.mode === 'per_contact').map((v) => v.name);
+  const needsPerContactMedia = campaign.resolvedMedia?.mode === 'per_contact';
+
   const optedOut = await optOutsService.getOptedOutSet(
     campaign.tenantId,
     entries.map((e) => e.phone)
   );
 
-  const rows = entries.map((entry) => ({
-    campaignId: campaign._id,
-    tenantId: campaign.tenantId,
-    phone: entry.phone,
-    variables: entry.variables || {},
-    mediaUrl: entry.mediaUrl || null,
-    status: optedOut.has(entry.phone) ? 'SKIPPED_OPTOUT' : 'PENDING',
-  }));
+  const rows = entries.map((entry) => {
+    if (optedOut.has(entry.phone)) {
+      return { campaignId: campaign._id, tenantId: campaign.tenantId, phone: entry.phone, variables: entry.variables || {}, mediaUrl: entry.mediaUrl || null, status: 'SKIPPED_OPTOUT' };
+    }
+
+    const missing = perContactVarNames.filter((name) => !entry.variables?.[name]?.toString().trim());
+    if (needsPerContactMedia && !entry.mediaUrl) missing.push('media');
+
+    return {
+      campaignId: campaign._id,
+      tenantId: campaign.tenantId,
+      phone: entry.phone,
+      variables: entry.variables || {},
+      mediaUrl: entry.mediaUrl || null,
+      status: missing.length ? 'FAILED' : 'PENDING',
+      error: missing.length ? `Missing: ${missing.join(', ')}` : null,
+    };
+  });
 
   await CampaignRecipient.insertMany(rows, { ordered: false });
 
   const skipped = rows.filter((r) => r.status === 'SKIPPED_OPTOUT').length;
+  const failed = rows.filter((r) => r.status === 'FAILED').length;
 
   await Campaign.updateOne(
     { _id: campaign._id },
-    { 'stats.total': rows.length, 'stats.skipped': skipped }
+    { 'stats.total': rows.length, 'stats.skipped': skipped, 'stats.failed': failed }
   );
+}
+
+// Only DRAFT campaigns can be edited — same rule as templates, and for
+// the same reason: once scheduled/running, Meta already has (or is
+// about to have) messages going out matching what was configured at
+// that point. Editing after that would silently change what a
+// half-finished send looks like partway through.
+async function updateCampaign(tenantId, id, authHeader, payload) {
+  const existing = await Campaign.findOne({ _id: id, tenantId });
+  if (!existing) {
+    const err = new Error('Campaign not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (existing.status !== 'DRAFT') {
+    const err = new Error('Only draft campaigns can be edited — cancel and recreate instead');
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const data = await buildCampaignData(tenantId, authHeader, payload);
+  Object.assign(existing, data);
+  await existing.save();
+
+  return existing.toObject();
 }
 
 async function updateStatus(tenantId, id, nextStatus) {
@@ -220,12 +306,47 @@ async function listRecipients(tenantId, campaignId, { status, page = 1, limit = 
   return { items, total, page: Number(page), limit: Number(limit) };
 }
 
+// A one-off send to a manually entered number, using this campaign's
+// already-resolved template/variables/media — for checking the template
+// renders correctly before actually scheduling it. Deliberately doesn't
+// touch CampaignRecipient or Campaign.stats.
+async function sendTest(tenantId, campaignId, { phone, testValues, testMediaUrl }) {
+  const campaign = await getCampaign(tenantId, campaignId);
+
+  const fakeRecipient = { phone, variables: testValues || {}, mediaUrl: testMediaUrl || null };
+  const { components, previewText } = templateBuilder.buildForRecipient(campaign, fakeRecipient);
+
+  const { data } = await axios.post(
+    `${configs.CENTER_SERVICE_URL}/campaign-messages`,
+    {
+      tenantId,
+      phone,
+      channel: 'whatsapp',
+      extension: campaign.extension,
+      queue: campaign.queue,
+      campaignId: String(campaign._id),
+      previewText,
+      template: {
+        name: campaign.template.name,
+        language: campaign.template.language,
+        category: campaign.template.category,
+        components,
+      },
+    },
+    { headers: { 'x-internal-key': configs.INTERNAL_SERVICE_KEY } }
+  );
+
+  return data?.data;
+}
+
 module.exports = {
   listCampaigns,
   getCampaign,
   createCampaign,
+  updateCampaign,
   updateStatus,
   deleteCampaign,
   scheduleCampaign,
   listRecipients,
+  sendTest,
 };

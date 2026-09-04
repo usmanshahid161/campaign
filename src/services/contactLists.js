@@ -46,6 +46,17 @@ async function createContactList(tenantId, { name }, userId) {
   }
 }
 
+async function renameContactList(tenantId, id, name) {
+  const list = await getContactList(tenantId, id);
+  if (!name?.trim()) {
+    const err = new Error('List name is required');
+    err.statusCode = 422;
+    throw err;
+  }
+  await ContactList.updateOne({ _id: id, tenantId }, { name: name.trim() });
+  return { ...list, name: name.trim() };
+}
+
 async function deleteContactList(tenantId, id) {
   const list = await ContactList.findOne({ _id: id, tenantId });
   if (!list) {
@@ -70,6 +81,11 @@ async function listEntries(tenantId, listId, { page = 1, limit = 50 } = {}) {
 }
 
 // Manual add — one contact at a time, from the UI's "add manually" form.
+// Free-form: whatever key-value pairs the admin wants to track (name,
+// city, invoice_no, ...) — not validated against any template, since
+// this list isn't bound to one. A campaign built off this list later
+// decides which of these columns (if any) line up with what its
+// template needs (see services/campaigns.js).
 async function addContact(tenantId, listId, { phone, variables, mediaUrl }) {
   await getContactList(tenantId, listId);
 
@@ -100,6 +116,27 @@ async function addContact(tenantId, listId, { phone, variables, mediaUrl }) {
   }
 }
 
+async function updateContact(tenantId, listId, entryId, { variables, mediaUrl }) {
+  await getContactList(tenantId, listId);
+  const entry = await ContactListEntry.findOneAndUpdate(
+    { _id: entryId, listId, tenantId },
+    {
+      // Merge rather than replace — filling in one missing column for a
+      // campaign shouldn't wipe out every other column already on this
+      // contact.
+      ...(variables ? { $set: Object.fromEntries(Object.entries(variables).map(([k, v]) => [`variables.${k}`, v])) } : {}),
+      ...(mediaUrl !== undefined ? { mediaUrl } : {}),
+    },
+    { new: true }
+  );
+  if (!entry) {
+    const err = new Error('Contact not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  return entry.toObject();
+}
+
 async function removeContact(tenantId, listId, entryId) {
   await getContactList(tenantId, listId);
   const result = await ContactListEntry.deleteOne({ _id: entryId, listId, tenantId });
@@ -110,12 +147,8 @@ async function removeContact(tenantId, listId, entryId) {
 }
 
 // CSV bulk import. Expected columns: `phone` (required), `media_url`
-// (optional — used later only if the campaign this list gets attached to
-// is mediaMode: 'per_contact'), and anything else becomes a named
-// template variable (e.g. a `name` column maps to {{1}} if the campaign's
-// variableMapping says so — the mapping itself is chosen at
-// campaign-creation time, not here, since the same list could be reused
-// for different templates later).
+// (optional), and anything else becomes a named field on each contact —
+// whatever columns the file has, freely.
 async function importCsv(tenantId, listId, buffer) {
   await getContactList(tenantId, listId);
 
@@ -176,8 +209,6 @@ async function importCsv(tenantId, listId, buffer) {
       const result = await ContactListEntry.insertMany(toInsert, { ordered: false });
       inserted = result.length;
     } catch (err) {
-      // BulkWriteError — some succeeded, some hit the unique index
-      // (listId+phone) because they were already on the list.
       inserted = err.insertedDocs?.length || err.result?.insertedCount || 0;
       existingDuplicates = toInsert.length - inserted;
     }
@@ -193,18 +224,53 @@ async function importCsv(tenantId, listId, buffer) {
     invalid: errors.length,
     duplicatesInFile,
     duplicatesAlreadyOnList: existingDuplicates,
-    errors: errors.slice(0, 50), // cap — a malformed file shouldn't return thousands of error rows
+    errors: errors.slice(0, 50),
   };
+}
+
+// For campaign creation's auto-detection — for a given list and a set
+// of column names (a template's variable names), reports what fraction
+// of this list's contacts already have each one filled in, so the
+// campaign-creation UI can default to "use existing data" when coverage
+// is complete and prompt for a shared value (or ask to fill it in)
+// otherwise.
+async function getColumnCoverage(tenantId, listId, columnNames) {
+  const total = await ContactListEntry.countDocuments({ listId, tenantId });
+  if (!total) return columnNames.map((name) => ({ name, total: 0, covered: 0, complete: false }));
+
+  const results = await Promise.all(
+    columnNames.map(async (name) => {
+      const covered = await ContactListEntry.countDocuments({
+        listId,
+        tenantId,
+        [`variables.${name}`]: { $exists: true, $nin: [null, ''] },
+      });
+      return { name, total, covered, complete: covered === total };
+    })
+  );
+
+  return results;
+}
+
+async function getMediaCoverage(tenantId, listId) {
+  const total = await ContactListEntry.countDocuments({ listId, tenantId });
+  if (!total) return { total: 0, covered: 0, complete: false };
+  const covered = await ContactListEntry.countDocuments({ listId, tenantId, mediaUrl: { $exists: true, $nin: [null, ''] } });
+  return { total, covered, complete: covered === total };
 }
 
 module.exports = {
   listContactLists,
   getContactList,
   createContactList,
+  renameContactList,
   deleteContactList,
   listEntries,
   addContact,
+  updateContact,
   removeContact,
   importCsv,
+  getColumnCoverage,
+  getMediaCoverage,
   normalizePhone,
 };
