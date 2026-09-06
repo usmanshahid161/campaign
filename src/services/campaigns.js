@@ -312,15 +312,16 @@ async function listRecipients(tenantId, campaignId, { status, page = 1, limit = 
 // touch CampaignRecipient or Campaign.stats.
 async function sendTest(tenantId, campaignId, { phone, testValues, testMediaUrl }) {
   const campaign = await getCampaign(tenantId, campaignId);
+  const normalizedPhone = (phone || '').replace(/\D/g, '');
 
-  const fakeRecipient = { phone, variables: testValues || {}, mediaUrl: testMediaUrl || null };
+  const fakeRecipient = { phone: normalizedPhone, variables: testValues || {}, mediaUrl: testMediaUrl || null };
   const { components, previewText } = templateBuilder.buildForRecipient(campaign, fakeRecipient);
 
   const { data } = await axios.post(
     `${configs.CENTER_SERVICE_URL}/campaign-messages`,
     {
       tenantId,
-      phone,
+      phone: normalizedPhone,
       channel: 'whatsapp',
       extension: campaign.extension,
       queue: campaign.queue,

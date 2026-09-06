@@ -20,7 +20,10 @@ async function transitionStatuses() {
   // list is already done.
   const running = await Campaign.find({ status: 'RUNNING' }).select('_id').lean();
   for (const { _id } of running) {
-    const pendingLeft = await CampaignRecipient.countDocuments({ campaignId: _id, status: 'PENDING' });
+    const pendingLeft = await CampaignRecipient.countDocuments({
+      campaignId: _id,
+      status: { $in: ['PENDING', 'SENDING'] },
+    });
     if (pendingLeft === 0) {
       await Campaign.updateOne({ _id }, { status: 'COMPLETED' });
     }
@@ -32,10 +35,32 @@ async function processCampaign(campaign) {
   // tick rather than rounding down to zero forever.
   const perTickBudget = Math.max(1, Math.ceil((campaign.rateLimitPerMinute * TICK_INTERVAL_MS) / 60000));
 
-  const recipients = await CampaignRecipient.find({ campaignId: campaign._id, status: 'PENDING' })
+  const candidates = await CampaignRecipient.find({ campaignId: campaign._id, status: 'PENDING' })
     .sort({ createdAt: 1 })
     .limit(perTickBudget)
     .lean();
+
+  console.log('[DEBUG] campaign', String(campaign._id), 'PENDING candidates:', candidates.length);
+
+  if (!candidates.length) return;
+
+  // Claimed one at a time, atomically — the instant a recipient is
+  // selected here, its status flips to SENDING (a transient claim
+  // state), *before* the actual send is even scheduled. Without this, a
+  // batch that takes longer to finish than the tick interval would
+  // still show as PENDING when the next tick's own query runs, get
+  // picked up again, and get sent to twice.
+  const recipients = [];
+  for (const candidate of candidates) {
+    const claimed = await CampaignRecipient.findOneAndUpdate(
+      { _id: candidate._id, status: 'PENDING' },
+      { status: 'SENDING' },
+      { new: true }
+    ).lean();
+    if (claimed) recipients.push(claimed);
+  }
+
+  console.log('[DEBUG] campaign', String(campaign._id), 'claimed for sending:', recipients.length, recipients.map((r) => r.phone));
 
   if (!recipients.length) return;
 
@@ -47,12 +72,20 @@ async function processCampaign(campaign) {
   for (let i = 0; i < recipients.length; i++) {
     const recipient = recipients[i];
     const allowed = await rateLimiter.tryConsumeSlot(campaign.tenantId, String(campaign._id), campaign.rateLimitPerMinute);
-    if (!allowed) break; // budget exhausted for this minute — rest stay PENDING, tried again next tick
+    console.log('[DEBUG] rate limiter allowed for', recipient.phone, ':', allowed);
+    if (!allowed) {
+      // Budget exhausted for this minute — give back the claim so this
+      // recipient is eligible again next tick instead of being stuck on
+      // SENDING forever with nothing actually in flight for it.
+      await CampaignRecipient.updateOne({ _id: recipient._id }, { status: 'PENDING' });
+      continue;
+    }
 
     // Fire-and-forget with a stagger — the tick itself doesn't wait for
     // Meta's response before considering the next recipient, sender.js
     // updates status independently as each one resolves.
     setTimeout(() => {
+      console.log('[DEBUG] setTimeout firing, calling sendToRecipient for', recipient.phone);
       sender.sendToRecipient(campaign, recipient).catch((err) => {
         console.error(`Campaign ${campaign._id} send error for ${recipient.phone}:`, err);
       });
@@ -61,10 +94,12 @@ async function processCampaign(campaign) {
 }
 
 async function tick() {
+  console.log('[DEBUG] worker tick running at', new Date().toISOString());
   try {
     await transitionStatuses();
 
     const running = await Campaign.find({ status: 'RUNNING' }).lean();
+    console.log('[DEBUG] RUNNING campaigns found:', running.length, running.map((c) => String(c._id)));
     for (const campaign of running) {
       await processCampaign(campaign);
     }
@@ -75,6 +110,21 @@ async function tick() {
 
 function start() {
   console.log('Campaign worker started');
+
+  // If the process crashed or restarted while some recipients were
+  // claimed (SENDING) but not yet resolved to SENT/FAILED, their actual
+  // outcome is unknown — safer to let them be retried than to leave
+  // them stuck on SENDING forever. Accepts a small risk of an occasional
+  // duplicate send in that rare crash-mid-send case, which is a better
+  // tradeoff than a recipient never being reached at all.
+  CampaignRecipient.updateMany({ status: 'SENDING' }, { status: 'PENDING' })
+    .then((result) => {
+      if (result.modifiedCount) {
+        console.log(`Campaign worker: recovered ${result.modifiedCount} recipient(s) stuck on SENDING`);
+      }
+    })
+    .catch((err) => console.error('Campaign worker recovery error:', err));
+
   setInterval(tick, TICK_INTERVAL_MS);
   tick(); // run one immediately on boot, don't wait for the first interval
 }

@@ -7,11 +7,17 @@ const ContactListEntry = require('../models/contactListEntry');
 // a leading + and 8-15 digits (E.164's actual bounds). Rejecting garbage
 // here is much cheaper than finding out from a failed Meta API call
 // later, one row at a time, mid-campaign.
+// Plain digits only — country code + number, nothing else (e.g.
+// "923075601696", never "+923075601696" or anything with spaces/dashes).
+// Matching the exact format inbound WhatsApp webhooks use for caller.id
+// is what matters here — a "+" or any other formatting difference means
+// center-service's Interaction.findOne({..., 'caller.id': phone}) won't
+// match an already-existing interaction for the same real number, and
+// ends up creating a second, duplicate one instead.
 function normalizePhone(raw) {
   if (!raw) return null;
-  const cleaned = String(raw).replace(/[\s\-().]/g, '');
-  const withPlus = cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
-  return /^\+\d{8,15}$/.test(withPlus) ? withPlus : null;
+  const digitsOnly = String(raw).replace(/\D/g, '');
+  return /^\d{8,15}$/.test(digitsOnly) ? digitsOnly : null;
 }
 
 async function listContactLists(tenantId) {

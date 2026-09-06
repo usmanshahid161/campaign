@@ -7,6 +7,7 @@ const optOutsService = require('./optOuts');
 const templateBuilder = require('./templateBuilder');
 
 async function sendToRecipient(campaign, recipient) {
+  console.log('[DEBUG] sendToRecipient called for', recipient?.phone, 'recipient._id:', recipient?._id);
   // Re-check opt-out at send time too, not just at materialization — a
   // long-running campaign could have someone opt out mid-flight, after
   // their row was already queued as PENDING.
@@ -30,6 +31,7 @@ async function sendToRecipient(campaign, recipient) {
   }
 
   try {
+    console.log('[DEBUG] calling', `${configs.CENTER_SERVICE_URL}/campaign-messages`, 'with phone:', JSON.stringify(toDigitsOnly(recipient?.phone)));
     const { data } = await axios.post(
       `${configs.CENTER_SERVICE_URL}/campaign-messages`,
       {

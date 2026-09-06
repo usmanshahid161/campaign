@@ -10,7 +10,12 @@ const campaignRecipientSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ['PENDING', 'SENT', 'FAILED', 'DELIVERED', 'READ', 'SKIPPED_OPTOUT'],
+      // SENDING is a transient claim state — set the instant a worker
+      // tick picks a recipient, *before* the actual (slower, async) send
+      // happens. Without it, a recipient could still show PENDING when
+      // the next tick's query runs, and get picked up and sent to a
+      // second time — see workers/campaignWorker.js.
+      enum: ['PENDING', 'SENDING', 'SENT', 'FAILED', 'DELIVERED', 'READ', 'SKIPPED_OPTOUT'],
       default: 'PENDING',
       index: true,
     },
