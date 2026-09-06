@@ -25,12 +25,16 @@ async function sendToRecipient(campaign, recipient) {
     return;
   }
 
+  function toDigitsOnly(phone) {
+    return (phone || '').replace(/\D/g, '');
+  }
+
   try {
     const { data } = await axios.post(
       `${configs.CENTER_SERVICE_URL}/campaign-messages`,
       {
         tenantId: campaign.tenantId,
-        phone: recipient.phone,
+        phone: toDigitsOnly(recipient?.phone),
         channel: 'whatsapp',
         extension: campaign.extension,
         queue: campaign.queue,

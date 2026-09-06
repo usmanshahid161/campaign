@@ -28,6 +28,22 @@ async function syncStatus({ messageId, channelMessageId, status }) {
     return recipient;
   }
 
+  if (status === 'FAILED') {
+    // Only a SENT recipient can actually fail here — once something's
+    // DELIVERED or READ, a later "failed" status from Meta doesn't mean
+    // the message itself failed (that ship's sailed), so it's left
+    // alone rather than overwriting a real delivery outcome.
+    const recipient = await CampaignRecipient.findOneAndUpdate(
+      { ...filter, status: 'SENT' },
+      { status: 'FAILED', error: 'Delivery failed' },
+      { new: true }
+    );
+    if (recipient) {
+      await Campaign.updateOne({ _id: recipient.campaignId }, { $inc: { 'stats.failed': 1 } });
+    }
+    return recipient;
+  }
+
   // READ — Meta doesn't always send a separate DELIVERED webhook first
   // (they can arrive out of order or get coalesced), so a read receipt
   // on a still-SENT recipient counts as both delivered *and* read for
