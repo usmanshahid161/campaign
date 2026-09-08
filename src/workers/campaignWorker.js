@@ -40,7 +40,6 @@ async function processCampaign(campaign) {
     .limit(perTickBudget)
     .lean();
 
-  console.log('[DEBUG] campaign', String(campaign._id), 'PENDING candidates:', candidates.length);
 
   if (!candidates.length) return;
 
@@ -60,7 +59,6 @@ async function processCampaign(campaign) {
     if (claimed) recipients.push(claimed);
   }
 
-  console.log('[DEBUG] campaign', String(campaign._id), 'claimed for sending:', recipients.length, recipients.map((r) => r.phone));
 
   if (!recipients.length) return;
 
@@ -72,7 +70,6 @@ async function processCampaign(campaign) {
   for (let i = 0; i < recipients.length; i++) {
     const recipient = recipients[i];
     const allowed = await rateLimiter.tryConsumeSlot(campaign.tenantId, String(campaign._id), campaign.rateLimitPerMinute);
-    console.log('[DEBUG] rate limiter allowed for', recipient.phone, ':', allowed);
     if (!allowed) {
       // Budget exhausted for this minute — give back the claim so this
       // recipient is eligible again next tick instead of being stuck on
@@ -85,7 +82,6 @@ async function processCampaign(campaign) {
     // Meta's response before considering the next recipient, sender.js
     // updates status independently as each one resolves.
     setTimeout(() => {
-      console.log('[DEBUG] setTimeout firing, calling sendToRecipient for', recipient.phone);
       sender.sendToRecipient(campaign, recipient).catch((err) => {
         console.error(`Campaign ${campaign._id} send error for ${recipient.phone}:`, err);
       });
@@ -94,12 +90,10 @@ async function processCampaign(campaign) {
 }
 
 async function tick() {
-  console.log('[DEBUG] worker tick running at', new Date().toISOString());
   try {
     await transitionStatuses();
 
     const running = await Campaign.find({ status: 'RUNNING' }).lean();
-    console.log('[DEBUG] RUNNING campaigns found:', running.length, running.map((c) => String(c._id)));
     for (const campaign of running) {
       await processCampaign(campaign);
     }

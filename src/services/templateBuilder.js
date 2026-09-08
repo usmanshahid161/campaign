@@ -20,6 +20,15 @@ function resolveMediaUrl(campaign, recipient) {
   return media.mode === 'per_contact' ? recipient.mediaUrl : media.sharedUrl;
 }
 
+// Card media flows through the exact same resolvedVariables entries as
+// any text variable (see campaign-service's campaigns.js) — per_contact
+// reads recipient.variables[name] same as a text var would, it just
+// happens to be a URL. So this is really just resolveVariableValue with
+// a cardIndex filter, not a separate resolution mechanism.
+function resolveCardMediaEntry(campaign, cardIndex) {
+  return (campaign.resolvedVariables || []).find((v) => v.component === 'card_media' && v.cardIndex === cardIndex);
+}
+
 function buildHeaderParameter(campaign, recipient) {
   const headerType = campaign.template.header?.type;
   if (!headerType || headerType === 'NONE') return null;
@@ -90,6 +99,112 @@ function fillHeaderPreview(campaign, recipient) {
   return text;
 }
 
+// One CAROUSEL component covering every card — each card resolves its
+// own media + body text completely independently of the others (and of
+// the main header/body above), matching how extractTemplateVariables
+// tagged them in the first place: card N's {{1}} has nothing to do with
+// card M's {{1}}.
+function buildCarouselComponent(campaign, recipient) {
+  const cards = campaign.template.carousel?.cards;
+  if (!cards?.length) return null;
+
+  return {
+    type: 'carousel',
+    cards: cards.map((card, cardIndex) => {
+      const cardComponents = [];
+
+      const mediaEntry = resolveCardMediaEntry(campaign, cardIndex);
+      if (mediaEntry) {
+        const url = resolveVariableValue(mediaEntry, recipient);
+        if (!url) {
+          const err = new Error(`No media available for card ${cardIndex + 1} (mode: ${mediaEntry.mode})`);
+          err.code = 'MISSING_MEDIA';
+          throw err;
+        }
+        const mediaType = card.header.type.toLowerCase(); // image | video
+        cardComponents.push({ type: 'header', parameters: [{ type: mediaType, [mediaType]: { link: url } }] });
+      }
+
+      const bodyEntries = (campaign.resolvedVariables || [])
+        .filter((v) => v.component === 'card_body' && v.cardIndex === cardIndex)
+        .sort((a, b) => Number(a.position) - Number(b.position));
+      if (bodyEntries.length) {
+        cardComponents.push({
+          type: 'body',
+          parameters: bodyEntries.map((entry) => {
+            const value = resolveVariableValue(entry, recipient);
+            return { type: 'text', text: value != null && value !== '' ? String(value) : `[${entry.name}]` };
+          }),
+        });
+      }
+
+      return { card_index: cardIndex, components: cardComponents };
+    }),
+  };
+}
+
+// A short, readable one-line-per-card summary appended to the stored
+// message text — not Meta's actual send format (that's
+// buildCarouselComponent above), just what shows in the agent's inbox
+// thread so the message isn't just the main body with no indication a
+// carousel went out too.
+function fillCarouselPreview(campaign, recipient) {
+  const cards = campaign.template.carousel?.cards;
+  if (!cards?.length) return '';
+
+  return cards
+    .map((card, cardIndex) => {
+      let text = card.body?.text || '';
+      (campaign.resolvedVariables || [])
+        .filter((v) => v.component === 'card_body' && v.cardIndex === cardIndex)
+        .forEach((entry) => {
+          const value = resolveVariableValue(entry, recipient);
+          text = text.replace(
+            new RegExp(`\\{\\{\\s*${entry.position}\\s*\\}\\}`, 'g'),
+            value != null && value !== '' ? String(value) : `[${entry.name}]`
+          );
+        });
+      return `[Card ${cardIndex + 1}] ${text}`;
+    })
+    .join('\n');
+}
+
+// A clean, display-ready shape — separate from the sparse
+// buildCarouselComponent above (which only includes what Meta actually
+// needs sent, so static card body text/buttons are often just absent
+// from it). This always has every card's resolved image/video URL and
+// filled body text, plus the card's own (static) buttons, so
+// center-service can store it as-is and the inbox thread can render a
+// full carousel without reconstructing anything from Meta's sparse
+// parameters or re-parsing the preview text.
+function buildCarouselDisplay(campaign, recipient) {
+  const cards = campaign.template.carousel?.cards;
+  if (!cards?.length) return null;
+
+  return cards.map((card, cardIndex) => {
+    const mediaEntry = resolveCardMediaEntry(campaign, cardIndex);
+    const imageUrl = mediaEntry ? resolveVariableValue(mediaEntry, recipient) : null;
+
+    let bodyText = card.body?.text || '';
+    (campaign.resolvedVariables || [])
+      .filter((v) => v.component === 'card_body' && v.cardIndex === cardIndex)
+      .forEach((entry) => {
+        const value = resolveVariableValue(entry, recipient);
+        bodyText = bodyText.replace(
+          new RegExp(`\\{\\{\\s*${entry.position}\\s*\\}\\}`, 'g'),
+          value != null && value !== '' ? String(value) : `[${entry.name}]`
+        );
+      });
+
+    return {
+      mediaType: card.header?.type || null,
+      imageUrl: imageUrl || null,
+      bodyText,
+      buttons: card.buttons || [],
+    };
+  });
+}
+
 // Returns { components, previewText } for one recipient — components go
 // straight into the message center-service/local-service sends to Meta;
 // previewText is the filled, human-readable text stored as the
@@ -103,11 +218,15 @@ function buildForRecipient(campaign, recipient) {
   const bodyParam = buildBodyParameter(campaign, recipient);
   if (bodyParam) components.push(bodyParam);
 
+  const carouselParam = buildCarouselComponent(campaign, recipient);
+  if (carouselParam) components.push(carouselParam);
+
   const headerText = fillHeaderPreview(campaign, recipient);
   const bodyText = fillBodyPreview(campaign, recipient);
-  const previewText = headerText ? `${headerText}\n\n${bodyText}` : bodyText;
+  const carouselPreview = fillCarouselPreview(campaign, recipient);
+  const previewText = [headerText, bodyText, carouselPreview].filter(Boolean).join('\n\n');
 
-  return { components, previewText };
+  return { components, previewText, carouselCards: buildCarouselDisplay(campaign, recipient) };
 }
 
 module.exports = { buildForRecipient };

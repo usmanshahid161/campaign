@@ -6,8 +6,15 @@ const CampaignRecipient = require('../models/campaignRecipient');
 const optOutsService = require('./optOuts');
 const templateBuilder = require('./templateBuilder');
 
+// Strips a leading + and any other non-digit characters — center-service
+// (and Meta's API beneath it) wants a plain digit-only number here, not
+// the E.164-with-+ format the rest of the system stores/matches on
+// (ContactListEntry, CampaignRecipient, dedup checks all keep the +).
+function toDigitsOnly(phone) {
+  return (phone || '').replace(/\D/g, '');
+}
+
 async function sendToRecipient(campaign, recipient) {
-  console.log('[DEBUG] sendToRecipient called for', recipient?.phone, 'recipient._id:', recipient?._id);
   // Re-check opt-out at send time too, not just at materialization — a
   // long-running campaign could have someone opt out mid-flight, after
   // their row was already queued as PENDING.
@@ -17,21 +24,16 @@ async function sendToRecipient(campaign, recipient) {
     return;
   }
 
-  let components, previewText;
+  let components, previewText, carouselCards;
   try {
-    ({ components, previewText } = templateBuilder.buildForRecipient(campaign, recipient));
+    ({ components, previewText, carouselCards } = templateBuilder.buildForRecipient(campaign, recipient));
   } catch (err) {
     await CampaignRecipient.updateOne({ _id: recipient._id }, { status: 'FAILED', error: err.message });
     await Campaign.updateOne({ _id: campaign._id }, { $inc: { 'stats.failed': 1 } });
     return;
   }
 
-  function toDigitsOnly(phone) {
-    return (phone || '').replace(/\D/g, '');
-  }
-
   try {
-    console.log('[DEBUG] calling', `${configs.CENTER_SERVICE_URL}/campaign-messages`, 'with phone:', JSON.stringify(toDigitsOnly(recipient?.phone)));
     const { data } = await axios.post(
       `${configs.CENTER_SERVICE_URL}/campaign-messages`,
       {
@@ -42,6 +44,11 @@ async function sendToRecipient(campaign, recipient) {
         queue: campaign.queue,
         campaignId: String(campaign._id),
         previewText,
+        // Display-only — see templateBuilder.js's buildCarouselDisplay.
+        // Not part of `template`/`components` below (that's what
+        // actually gets sent to Meta); center-service just stores this
+        // as-is on the message for the inbox thread to render.
+        carouselCards,
         template: {
           name: campaign.template.name,
           language: campaign.template.language,

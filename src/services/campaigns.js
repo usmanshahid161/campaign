@@ -69,6 +69,13 @@ async function buildCampaignData(tenantId, authHeader, payload) {
   }
 
   const templateVars = extractTemplateVariables(template);
+  // Only the main header's own media (component: 'media') gets special,
+  // separate handling via mediaConfig below — that's the existing,
+  // already-relied-on flow. Card media (component: 'card_media') flows
+  // through the same variableConfig mechanism as every text variable
+  // instead: same {name, mode, value} shape, `value` just happens to be
+  // a URL for these instead of text. Simpler than inventing a second,
+  // parallel media-config path just for carousel cards.
   const realVars = templateVars.filter((v) => v.component !== 'media');
   const mediaVar = templateVars.find((v) => v.component === 'media');
 
@@ -82,15 +89,22 @@ async function buildCampaignData(tenantId, authHeader, payload) {
 
   const resolvedVariables = realVars.map((v) => {
     const submitted = configByName.get(v.name);
+    const base = { component: v.component, position: v.position, name: v.name };
+    // card_body/card_media entries carry cardIndex through so
+    // templateBuilder.js (send time) knows which card each one belongs
+    // to — plain header/body variables have no card, so this stays
+    // undefined for them rather than a misleading 0.
+    if (v.cardIndex !== undefined) base.cardIndex = v.cardIndex;
+
     if (submitted.mode === 'shared') {
       if (!submitted.value?.toString().trim()) {
         const err = new Error(`"${v.name}" is marked shared but has no value`);
         err.statusCode = 422;
         throw err;
       }
-      return { component: v.component, position: v.position, name: v.name, mode: 'shared', value: String(submitted.value).trim() };
+      return { ...base, mode: 'shared', value: String(submitted.value).trim() };
     }
-    return { component: v.component, position: v.position, name: v.name, mode: 'per_contact', value: null };
+    return { ...base, mode: 'per_contact', value: null };
   });
 
   let resolvedMedia = { mode: null, sharedUrl: null };
@@ -121,6 +135,7 @@ async function buildCampaignData(tenantId, authHeader, payload) {
       category: template.category,
       header: template.components?.header || { type: 'NONE', text: '' },
       body: { text: template.components?.body?.text || '' },
+      carousel: template.carousel || null,
     },
     resolvedVariables,
     resolvedMedia,
@@ -315,7 +330,7 @@ async function sendTest(tenantId, campaignId, { phone, testValues, testMediaUrl 
   const normalizedPhone = (phone || '').replace(/\D/g, '');
 
   const fakeRecipient = { phone: normalizedPhone, variables: testValues || {}, mediaUrl: testMediaUrl || null };
-  const { components, previewText } = templateBuilder.buildForRecipient(campaign, fakeRecipient);
+  const { components, previewText, carouselCards } = templateBuilder.buildForRecipient(campaign, fakeRecipient);
 
   const { data } = await axios.post(
     `${configs.CENTER_SERVICE_URL}/campaign-messages`,
@@ -327,6 +342,7 @@ async function sendTest(tenantId, campaignId, { phone, testValues, testMediaUrl 
       queue: campaign.queue,
       campaignId: String(campaign._id),
       previewText,
+      carouselCards,
       template: {
         name: campaign.template.name,
         language: campaign.template.language,

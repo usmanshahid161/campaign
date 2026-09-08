@@ -36,6 +36,33 @@ function extractTemplateVariables(template) {
     });
   });
 
+  // Carousel cards each carry their own independent variables — a
+  // card's {{1}} has nothing to do with the main body's {{1}}, or with
+  // another card's {{1}}, so every entry is tagged with which card it
+  // belongs to (cardIndex) as well as position, same shared/per-contact
+  // treatment as everything else (see campaign-service's campaigns.js,
+  // which resolves these the same way it resolves header/body/media).
+  (template.carousel?.cards || []).forEach((card, cardIndex) => {
+    if (['IMAGE', 'VIDEO'].includes(card.header?.type)) {
+      variables.push({
+        component: 'card_media',
+        cardIndex,
+        position: null,
+        name: `card_${cardIndex + 1}_media`,
+        mediaType: card.header.type,
+      });
+    }
+
+    extractPositions(card.body?.text).forEach((pos) => {
+      variables.push({
+        component: 'card_body',
+        cardIndex,
+        position: pos,
+        name: card.body?.variableNames?.[Number(pos) - 1] || `card_${cardIndex + 1}_body_${pos}`,
+      });
+    });
+  });
+
   return variables;
 }
 

@@ -38,6 +38,12 @@ const campaignSchema = new mongoose.Schema(
         text: { type: String, default: '' },
       },
       body: { text: { type: String, required: true } },
+      // Present only for carousel templates — mongoose.Schema.Types.Mixed
+      // rather than fully modeled out, since each card's literal
+      // header/body text (with {{n}} placeholders still in place) is
+      // only ever read back by templateBuilder.js at send time, never
+      // queried on its own.
+      carousel: { type: mongoose.Schema.Types.Mixed, default: null },
     },
 
     // Copied from the contact list's own variableConfig at creation time
@@ -49,11 +55,20 @@ const campaignSchema = new mongoose.Schema(
     resolvedVariables: [
       {
         _id: false,
-        component: { type: String, enum: ['header', 'body'] },
+        component: { type: String, enum: ['header', 'body', 'card_body', 'card_media'] },
         position: String,
+        // Which carousel card this belongs to (0-indexed) — only set for
+        // card_body/card_media entries. header/body variables aren't
+        // part of any card, so this stays unset for them rather than a
+        // misleading 0.
+        cardIndex: { type: Number, default: undefined },
         name: String,
         mode: { type: String, enum: ['per_contact', 'shared'] },
-        value: { type: String, default: null }, // shared only
+        // shared only — a plain value for card_body, a media URL for
+        // card_media (and for the historical plain 'media' case too,
+        // though that one's actually tracked separately in
+        // resolvedMedia below, not through this array).
+        value: { type: String, default: null },
       },
     ],
 
