@@ -38,6 +38,11 @@ const campaignSchema = new mongoose.Schema(
         text: { type: String, default: '' },
       },
       body: { text: { type: String, required: true } },
+      // Literal main-template buttons (with {{1}} still in URL text if
+      // dynamic) — mongoose.Schema.Types.Mixed since, like carousel
+      // below, these are only ever read back by templateBuilder.js at
+      // send time, never queried on their own.
+      buttons: { type: [mongoose.Schema.Types.Mixed], default: [] },
       // Present only for carousel templates — mongoose.Schema.Types.Mixed
       // rather than fully modeled out, since each card's literal
       // header/body text (with {{n}} placeholders still in place) is

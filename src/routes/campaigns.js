@@ -15,6 +15,10 @@ router.post('/:id/pause', controller.pause);
 router.post('/:id/resume', controller.resume);
 router.post('/:id/cancel', controller.cancel);
 
+// Standalone template test-send — not tied to any campaign, so this
+// deliberately sits outside the /:id-scoped routes above.
+router.post('/test-send', controller.testSendTemplate);
+
 router.get('/:id/recipients', controller.listRecipients);
 router.get('/:id/stats', controller.getStats);
 

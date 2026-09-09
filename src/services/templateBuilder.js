@@ -71,6 +71,26 @@ function buildBodyParameter(campaign, recipient) {
   return { type: 'body', parameters };
 }
 
+// One component per dynamic URL button on the *main* template — Meta
+// wants each one sent separately (type: 'button', with its own `index`
+// identifying which button among the template's own buttons array),
+// not bundled together the way header/body parameters are. Only the
+// suffix value goes here, never the full URL — Meta reconstructs the
+// complete URL server-side from the template's own approved pattern.
+function buildButtonParameters(campaign, recipient) {
+  return (campaign.resolvedVariables || [])
+    .filter((v) => v.component === 'button')
+    .map((entry) => {
+      const value = resolveVariableValue(entry, recipient);
+      return {
+        type: 'button',
+        sub_type: 'url',
+        index: String(entry.buttonIndex),
+        parameters: [{ type: 'text', text: value != null && value !== '' ? String(value) : '' }],
+      };
+    });
+}
+
 function fillBodyPreview(campaign, recipient) {
   let text = campaign.template.body.text || '';
   (campaign.resolvedVariables || [])
@@ -138,6 +158,22 @@ function buildCarouselComponent(campaign, recipient) {
         });
       }
 
+      // Same per-button component shape as the main template's own URL
+      // buttons above — just scoped to this one card's buttons array,
+      // via card_button entries' buttonIndex.
+      const cardButtonEntries = (campaign.resolvedVariables || []).filter(
+        (v) => v.component === 'card_button' && v.cardIndex === cardIndex
+      );
+      cardButtonEntries.forEach((entry) => {
+        const value = resolveVariableValue(entry, recipient);
+        cardComponents.push({
+          type: 'button',
+          sub_type: 'url',
+          index: String(entry.buttonIndex),
+          parameters: [{ type: 'text', text: value != null && value !== '' ? String(value) : '' }],
+        });
+      });
+
       return { card_index: cardIndex, components: cardComponents };
     }),
   };
@@ -200,7 +236,18 @@ function buildCarouselDisplay(campaign, recipient) {
       mediaType: card.header?.type || null,
       imageUrl: imageUrl || null,
       bodyText,
-      buttons: card.buttons || [],
+      // Buttons with a resolved value get their {{1}} filled in for
+      // display (so the inbox thread shows the real link, not a
+      // placeholder) — buttons with no dynamic part pass through as-is.
+      buttons: (card.buttons || []).map((btn, buttonIndex) => {
+        if (btn.type !== 'URL') return btn;
+        const entry = (campaign.resolvedVariables || []).find(
+          (v) => v.component === 'card_button' && v.cardIndex === cardIndex && v.buttonIndex === buttonIndex
+        );
+        if (!entry) return btn;
+        const value = resolveVariableValue(entry, recipient);
+        return { ...btn, url: btn.url.replace(new RegExp(`\\{\\{\\s*${entry.position}\\s*\\}\\}`, 'g'), value != null && value !== '' ? String(value) : '') };
+      }),
     };
   });
 }
@@ -217,6 +264,11 @@ function buildForRecipient(campaign, recipient) {
 
   const bodyParam = buildBodyParameter(campaign, recipient);
   if (bodyParam) components.push(bodyParam);
+
+  // Multiple separate button components if the template has more than
+  // one dynamic URL button — Meta doesn't accept these bundled together
+  // the way header/body parameters are.
+  components.push(...buildButtonParameters(campaign, recipient));
 
   const carouselParam = buildCarouselComponent(campaign, recipient);
   if (carouselParam) components.push(carouselParam);

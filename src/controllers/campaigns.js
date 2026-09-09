@@ -36,6 +36,14 @@ exports.sendTest = asyncHandler(async (req, res) => {
   res.status(200).json({ success: true, data: result });
 });
 
+// Standalone — not tied to any campaign, see services/campaigns.js's
+// testSendTemplate for why the whole thing is built as a "fake campaign"
+// around the fetched template instead.
+exports.testSendTemplate = asyncHandler(async (req, res) => {
+  const result = await campaignsService.testSendTemplate(req.user.tenantId, req.headers.authorization, req.body);
+  res.status(200).json({ success: true, data: result });
+});
+
 exports.pause = asyncHandler(async (req, res) => {
   const campaign = await campaignsService.updateStatus(req.user.tenantId, req.params.id, 'PAUSED');
   res.status(200).json({ success: true, data: campaign });

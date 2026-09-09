@@ -36,6 +36,25 @@ function extractTemplateVariables(template) {
     });
   });
 
+  // A URL button can carry one dynamic {{1}} as a suffix on its URL
+  // (Meta only supports it at the end, but this just looks for {{n}}
+  // generically same as everywhere else — Meta's own template review
+  // is what actually enforces the "must be a suffix" rule). buttonIndex
+  // is the button's position among the main buttons array, since
+  // templateBuilder.js needs to know exactly which button a resolved
+  // value belongs to at send time.
+  (template.components?.buttons || []).forEach((button, buttonIndex) => {
+    if (button.type !== 'URL') return;
+    extractPositions(button.url).forEach((pos) => {
+      variables.push({
+        component: 'button',
+        buttonIndex,
+        position: pos,
+        name: button.variableName || `button_${buttonIndex + 1}_url`,
+      });
+    });
+  });
+
   // Carousel cards each carry their own independent variables — a
   // card's {{1}} has nothing to do with the main body's {{1}}, or with
   // another card's {{1}}, so every entry is tagged with which card it
@@ -59,6 +78,19 @@ function extractTemplateVariables(template) {
         cardIndex,
         position: pos,
         name: card.body?.variableNames?.[Number(pos) - 1] || `card_${cardIndex + 1}_body_${pos}`,
+      });
+    });
+
+    (card.buttons || []).forEach((button, buttonIndex) => {
+      if (button.type !== 'URL') return;
+      extractPositions(button.url).forEach((pos) => {
+        variables.push({
+          component: 'card_button',
+          cardIndex,
+          buttonIndex,
+          position: pos,
+          name: button.variableName || `card_${cardIndex + 1}_button_${buttonIndex + 1}_url`,
+        });
       });
     });
   });

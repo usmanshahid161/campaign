@@ -95,6 +95,11 @@ async function buildCampaignData(tenantId, authHeader, payload) {
     // to — plain header/body variables have no card, so this stays
     // undefined for them rather than a misleading 0.
     if (v.cardIndex !== undefined) base.cardIndex = v.cardIndex;
+    // button/card_button entries carry which button (0-indexed, among
+    // that scope's own buttons array) the resolved URL suffix belongs to
+    // — templateBuilder.js needs this to build the right BUTTONS
+    // component parameter at send time.
+    if (v.buttonIndex !== undefined) base.buttonIndex = v.buttonIndex;
 
     if (submitted.mode === 'shared') {
       if (!submitted.value?.toString().trim()) {
@@ -135,6 +140,7 @@ async function buildCampaignData(tenantId, authHeader, payload) {
       category: template.category,
       header: template.components?.header || { type: 'NONE', text: '' },
       body: { text: template.components?.body?.text || '' },
+      buttons: template.components?.buttons || [],
       carousel: template.carousel || null,
     },
     resolvedVariables,
@@ -170,10 +176,17 @@ async function createCampaign(tenantId, authHeader, payload, userId) {
 // running campaign messages. Anyone already opted out is recorded as
 // SKIPPED_OPTOUT immediately rather than PENDING, so they never get
 // attempted and the dashboard shows accurately why they were skipped.
-async function materializeRecipients(campaign) {
+async function materializeRecipients(campaign, excludePhones = new Set()) {
   const entries = await ContactListEntry.find({ listId: campaign.contactListId, tenantId: campaign.tenantId }).lean();
+  // excludePhones is only ever non-empty when re-materializing after an
+  // edit (see rematerializeRecipients) — those phones already have a
+  // real, irreversible CampaignRecipient (sent/delivered/read/opted
+  // out) from before the edit, so they're skipped here rather than
+  // getting a second, duplicate row.
+  const eligibleEntries = entries.filter((e) => !excludePhones.has(e.phone));
 
-  if (!entries.length) {
+  if (!eligibleEntries.length) {
+    if (excludePhones.size > 0) return; // re-edit case — nothing new to add is fine
     const err = new Error('This contact list has no contacts');
     err.statusCode = 422;
     throw err;
@@ -187,10 +200,10 @@ async function materializeRecipients(campaign) {
 
   const optedOut = await optOutsService.getOptedOutSet(
     campaign.tenantId,
-    entries.map((e) => e.phone)
+    eligibleEntries.map((e) => e.phone)
   );
 
-  const rows = entries.map((entry) => {
+  const rows = eligibleEntries.map((entry) => {
     if (optedOut.has(entry.phone)) {
       return { campaignId: campaign._id, tenantId: campaign.tenantId, phone: entry.phone, variables: entry.variables || {}, mediaUrl: entry.mediaUrl || null, status: 'SKIPPED_OPTOUT' };
     }
@@ -210,21 +223,56 @@ async function materializeRecipients(campaign) {
   });
 
   await CampaignRecipient.insertMany(rows, { ordered: false });
+  await recomputeStats(campaign._id);
+}
 
-  const skipped = rows.filter((r) => r.status === 'SKIPPED_OPTOUT').length;
-  const failed = rows.filter((r) => r.status === 'FAILED').length;
-
+// A full recount rather than incremental +1/-1 bookkeeping — simpler to
+// reason about and always correct regardless of what changed underneath
+// it (a fresh materialize, a re-materialize after an edit, individual
+// status updates from sender.js, whatever). Called after anything that
+// changes the CampaignRecipient rows for a campaign.
+async function recomputeStats(campaignId) {
+  const [total, sent, delivered, read, failed, skipped] = await Promise.all([
+    CampaignRecipient.countDocuments({ campaignId }),
+    CampaignRecipient.countDocuments({ campaignId, status: 'SENT' }),
+    CampaignRecipient.countDocuments({ campaignId, status: 'DELIVERED' }),
+    CampaignRecipient.countDocuments({ campaignId, status: 'READ' }),
+    CampaignRecipient.countDocuments({ campaignId, status: 'FAILED' }),
+    CampaignRecipient.countDocuments({ campaignId, status: 'SKIPPED_OPTOUT' }),
+  ]);
   await Campaign.updateOne(
-    { _id: campaign._id },
-    { 'stats.total': rows.length, 'stats.skipped': skipped, 'stats.failed': failed }
+    { _id: campaignId },
+    { 'stats.total': total, 'stats.sent': sent, 'stats.delivered': delivered, 'stats.read': read, 'stats.failed': failed, 'stats.skipped': skipped }
   );
 }
 
-// Only DRAFT campaigns can be edited — same rule as templates, and for
-// the same reason: once scheduled/running, Meta already has (or is
-// about to have) messages going out matching what was configured at
-// that point. Editing after that would silently change what a
-// half-finished send looks like partway through.
+// Used when editing a campaign that already has recipients (anything
+// past DRAFT — see updateCampaign) rather than materializeRecipients
+// directly: recipients that already went out (SENT/DELIVERED/READ) or
+// were opted out are real, irreversible activity and must survive the
+// edit untouched. Only PENDING/FAILED rows — which reflect the OLD
+// configuration and haven't actually gone anywhere — get torn down and
+// rebuilt from the new one.
+async function rematerializeRecipients(campaign) {
+  const processed = await CampaignRecipient.find({
+    campaignId: campaign._id,
+    status: { $in: ['SENT', 'DELIVERED', 'READ', 'SKIPPED_OPTOUT'] },
+  })
+    .select('phone')
+    .lean();
+  const processedPhones = new Set(processed.map((p) => p.phone));
+
+  await CampaignRecipient.deleteMany({ campaignId: campaign._id, status: { $in: ['PENDING', 'FAILED'] } });
+
+  await materializeRecipients(campaign, processedPhones);
+}
+
+// Anything except RUNNING can be edited — a live send in progress is the
+// one state where changing the configuration underneath it would be
+// genuinely dangerous (Meta already has messages going out matching
+// what was configured a moment ago). SCHEDULED/PAUSED/COMPLETED/
+// CANCELLED are all safe to edit; see rematerializeRecipients for how
+// already-processed recipients survive an edit untouched.
 async function updateCampaign(tenantId, id, authHeader, payload) {
   const existing = await Campaign.findOne({ _id: id, tenantId });
   if (!existing) {
@@ -232,15 +280,36 @@ async function updateCampaign(tenantId, id, authHeader, payload) {
     err.statusCode = 404;
     throw err;
   }
-  if (existing.status !== 'DRAFT') {
-    const err = new Error('Only draft campaigns can be edited — cancel and recreate instead');
+  if (existing.status === 'RUNNING') {
+    const err = new Error('A running campaign can\'t be edited — pause it first');
     err.statusCode = 409;
     throw err;
   }
 
+  const hadRecipients = existing.status !== 'DRAFT';
+
   const data = await buildCampaignData(tenantId, authHeader, payload);
   Object.assign(existing, data);
   await existing.save();
+
+  if (hadRecipients) {
+    await rematerializeRecipients(existing);
+
+    // A COMPLETED/CANCELLED campaign that ends up with new PENDING
+    // recipients after the edit (a changed contact list, newly added
+    // contacts, whatever) needs to go back to SCHEDULED — the worker
+    // only ever processes RUNNING campaigns, reached via
+    // transitionStatuses' SCHEDULED→RUNNING check, so leaving the
+    // status as COMPLETED/CANCELLED would mean those new recipients
+    // just sit there forever, never actually sent.
+    if (['COMPLETED', 'CANCELLED'].includes(existing.status)) {
+      const stillPending = await CampaignRecipient.countDocuments({ campaignId: existing._id, status: 'PENDING' });
+      if (stillPending > 0) {
+        existing.status = 'SCHEDULED';
+        await existing.save();
+      }
+    }
+  }
 
   return existing.toObject();
 }
@@ -356,6 +425,84 @@ async function sendTest(tenantId, campaignId, { phone, testValues, testMediaUrl 
   return data?.data;
 }
 
+// Standalone template test-send — not tied to any campaign at all, just
+// "does this template render/send correctly". Everything is 'shared'
+// mode since there's no contact list or per-recipient concept here, just
+// one phone number and whatever values were typed into the test modal.
+// Reuses the exact same templateBuilder.buildForRecipient used for real
+// campaigns by assembling a minimal fake "campaign" shape around the
+// fetched template — same reason sendTest above does the same thing,
+// just without needing an actual saved Campaign document at all.
+async function testSendTemplate(tenantId, authHeader, { templateId, phone, extension, queue, variableValues = {}, mediaUrls = {} }) {
+  const template = await templatesService.getTemplate(authHeader, templateId);
+  const templateVars = extractTemplateVariables(template);
+  const normalizedPhone = (phone || '').replace(/\D/g, '');
+
+  const realVars = templateVars.filter((v) => v.component !== 'media');
+  const mediaVar = templateVars.find((v) => v.component === 'media');
+
+  const resolvedVariables = realVars.map((v) => {
+    const base = { component: v.component, position: v.position, name: v.name, mode: 'shared' };
+    if (v.cardIndex !== undefined) base.cardIndex = v.cardIndex;
+    if (v.buttonIndex !== undefined) base.buttonIndex = v.buttonIndex;
+    // card_media's value is a URL, sourced from mediaUrls same as the
+    // main header below — everything else is a plain typed value.
+    const value = v.component === 'card_media' ? mediaUrls[v.name] : variableValues[v.name];
+    return { ...base, value: value || '' };
+  });
+
+  const resolvedMedia = mediaVar
+    ? { mode: 'shared', sharedUrl: mediaUrls[mediaVar.name] || null }
+    : { mode: null, sharedUrl: null };
+
+  const fakeCampaign = {
+    tenantId,
+    extension,
+    queue,
+    template: {
+      name: template.name,
+      language: template.language,
+      category: template.category,
+      header: template.components?.header || { type: 'NONE', text: '' },
+      body: { text: template.components?.body?.text || '' },
+      buttons: template.components?.buttons || [],
+      carousel: template.carousel || null,
+    },
+    resolvedVariables,
+    resolvedMedia,
+  };
+
+  const { components, previewText, carouselCards } = templateBuilder.buildForRecipient(fakeCampaign, {
+    phone: normalizedPhone,
+    variables: {},
+    mediaUrl: null,
+  });
+
+  const { data } = await axios.post(
+    `${configs.CENTER_SERVICE_URL}/campaign-messages`,
+    {
+      tenantId,
+      phone: normalizedPhone,
+      channel: 'whatsapp',
+      extension,
+      queue,
+      previewText,
+      carouselCards,
+      template: {
+        name: template.name,
+        language: template.language,
+        category: template.category,
+        components,
+      },
+      // campaignId deliberately omitted — see center-service's
+      // campaignMessage.js, where it's optional specifically for this.
+    },
+    { headers: { 'x-internal-key': configs.INTERNAL_SERVICE_KEY } }
+  );
+
+  return data?.data;
+}
+
 module.exports = {
   listCampaigns,
   getCampaign,
@@ -366,4 +513,5 @@ module.exports = {
   scheduleCampaign,
   listRecipients,
   sendTest,
+  testSendTemplate,
 };
